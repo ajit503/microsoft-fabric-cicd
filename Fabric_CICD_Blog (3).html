@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Enterprise CI/CD for Microsoft Fabric</title>
+<style>
+  body { font-family: Georgia, serif; max-width: 860px; margin: 0 auto; padding: 40px 20px; color: #1a1a1a; line-height: 1.8; font-size: 18px; }
+  h1 { font-size: 40px; font-weight: 700; margin-bottom: 8px; line-height: 1.2; }
+  h2 { font-size: 28px; font-weight: 700; margin-top: 48px; margin-bottom: 16px; border-bottom: 2px solid #00B294; padding-bottom: 8px; }
+  h3 { font-size: 22px; font-weight: 700; margin-top: 36px; margin-bottom: 12px; }
+  h4 { font-size: 18px; font-weight: 700; margin-top: 28px; margin-bottom: 8px; color: #333; }
+  p { margin-bottom: 20px; }
+  pre { background: #0F2027; color: #e0e0e0; padding: 20px 24px; border-radius: 8px; overflow-x: auto; margin: 24px 0; font-size: 14px; line-height: 1.6; border-left: 4px solid #00B294; }
+  code { font-family: Consolas, Monaco, monospace; }
+  pre code { background: none; padding: 0; color: #e0e0e0; font-size: 14px; }
+  p code, li code { background: #f0f4f4; padding: 2px 6px; border-radius: 4px; font-size: 15px; color: #0F2027; }
+  blockquote { border-left: 4px solid #00B294; margin: 24px 0; padding: 12px 20px; background: #f0faf8; color: #333; border-radius: 0 8px 8px 0; }
+  ul, ol { padding-left: 28px; margin-bottom: 20px; }
+  li { margin-bottom: 8px; }
+  hr { border: none; border-top: 1px solid #e0e0e0; margin: 40px 0; }
+  a { color: #00B294; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<h1>Implementing Enterprise-Grade CI/CD for Microsoft Fabric — A Technical Deep Dive</h1>
+<p><em>How to build a production-ready, team-scoped deployment pipeline using fabric-cicd, Azure DevOps, and Fabric-native Variable Libraries</em></p>
+<hr />
+<h2>Introduction</h2>
+<p>Microsoft Fabric has rapidly matured as an end-to-end analytics platform, but one area that still challenges many teams is <strong>how to operationalize deployments</strong>. Without a proper CI/CD strategy, teams resort to manual workspace promotion, inconsistent environments, and configuration drift between DEV, UAT, and PROD — exactly the kind of technical debt that slows data engineering teams down.</p>
+<p>This article walks through a production-grade Fabric CI/CD implementation built on:</p>
+<ul>
+<li><strong><code>fabric-cicd</code></strong> — the Microsoft-backed open-source deployment tool</li>
+<li><strong>Azure DevOps (ADO)</strong> — pipelines, variable groups, and Git integration</li>
+<li><strong>Fabric-native Variable Libraries</strong> — runtime, environment-aware parameterization for items that support it (Notebooks, Data Pipelines, Copy Jobs, Shortcuts, Dataflows)</li>
+<li><strong><code>parameter.yml</code></strong> — deployment-time parameterization via <code>fabric-cicd</code> for items that do not yet support Variable Libraries (Fabric Environments, Semantic Models)</li>
+<li><strong>Cherry-pick based branch promotion</strong> — for safe, deliberate environment progression</li>
+</ul>
+<blockquote>
+<p><strong>On parameterization:</strong> the recommended approach is to use <strong>Variable Libraries wherever supported</strong> and fall back to <strong><code>parameter.yml</code></strong> for items that don't support them yet. Most teams will run both in parallel until Microsoft extends Variable Library support to all Fabric item types.</p>
+</blockquote>
+<p>This is not a "getting started" walkthrough. It is a technical reference for data engineers and architects who want to understand the <em>why</em> behind each design decision — including the gotchas we hit in production.</p>
+<hr />
+<h2>Architecture Overview</h2>
+<p>The deployment model is built around three core principles:</p>
+<ol>
+<li><strong>One repository per team</strong> — Each team (e.g. FrontOffice, BackOffice, Enterprise) maintains its own dedicated ADO repository. This is not just an organizational preference — it is a deliberate architectural boundary that eliminates cross-team Git merge conflicts, prevents one team's changes from accidentally landing in another team's deployment pipeline, and keeps the blast radius of any failed deployment scoped to a single team. Separate repos also simplify branch policies, cherry-pick promotions, and audit trails, since every commit on a branch belongs unambiguously to one team.</li>
+<li><strong>Full deployment every time</strong> — <code>fabric-cicd</code> deploys everything in the repo's scope on every pipeline run; there is no selective item deployment (though <code>item_type_in_scope</code> narrows scope by type)</li>
+<li><strong>Four-environment separation via Fabric workspaces</strong> — Feature, DEV, UAT, and PROD are distinct Fabric workspaces. Feature and DEV workspaces are connected to their corresponding Git branches via Fabric's native Git integration. UAT and PROD workspaces are not connected to any branch — <code>fabric-cicd</code> deploys items directly from the <code>uat</code> and <code>main</code> branch project folder in the repo to the corresponding workspace at pipeline runtime.</li>
+</ol>
+<p>The full workspace-to-branch mapping looks like this:</p>
+<div class="codehilite"><pre><span></span><code>ADO Git Repository (FabricTeamRepo)
+        │
+        ├── feature/&lt;n&gt; ◄──────────────────► Feature Workspace(s)
+        │                [Fabric native Git sync — bidirectional]
+        │
+        ├── dev ◄──────────────────────────► DEV Workspace
+        │                [Fabric native Git sync — bidirectional]
+        │
+        ├── uat ──── ADO pipeline reads repo ────► UAT Workspace
+        │                [fabric-cicd, no Git sync on workspace]
+        │
+        └── main ─── ADO pipeline reads repo ────► PROD Workspace
+                         [fabric-cicd, no Git sync on workspace]
+</code></pre></div>
+
+<p><strong>Two distinct integration mechanisms are in play:</strong></p>
+<ul>
+<li><strong>Feature and DEV workspaces</strong> use <strong>Fabric's native Git integration</strong> — a bidirectional sync between each workspace and its corresponding branch. Developers create and modify Fabric items directly in their Feature workspace UI, then commit those changes to their feature branch using Fabric Git Sync. When the feature is ready, changes are merged from the feature branch into the <code>dev</code> branch via a PR — at which point a developer manually syncs the DEV workspace from the <code>dev</code> branch using Fabric Git Sync. No ADO pipeline is involved at this layer.</li>
+</ul>
+<blockquote>
+<p><strong>Note:</strong> This manual sync step can be automated using the <a href="https://learn.microsoft.com/en-us/rest/api/fabric/core/git/update-from-git">Fabric Git Sync API</a> — triggering an <code>updateFromGit</code> call as part of the ADO pipeline after the PR merges into <code>dev</code>. For this implementation, the sync is kept manual.<br />
+- <strong>UAT and PROD workspaces are not connected to any Git branch.</strong> When a PR merges into <code>uat</code> or <code>main</code>, the ADO pipeline checks out the repo at that point and runs <code>fabric-cicd</code> to push item definitions directly to the target workspace. These workspaces never pull from Git — they only receive items when a pipeline explicitly runs.</p>
+</blockquote>
+<p>This separation is deliberate: the feature layer is optimized for developer speed and iteration; the UAT/PROD layer is optimized for stability and governance — workspaces receive deployments only when a pipeline runs, never via passive Git sync.</p>
+<hr />
+<h2>Repository Structure</h2>
+<p>The repository is organized into two top-level workspace subdirectories — <code>engineering</code> for all data engineering Fabric items, and <code>presentation</code> for semantic models and reports. Deployment scripts and pipelines are kept outside <code>workspace/</code> so they are never treated as deployable Fabric items.</p>
+<div class="codehilite"><pre><span></span><code><span class="n">FabricTeamRepo</span><span class="o">/</span><span class="w">                          </span><span class="err">←</span><span class="w"> </span><span class="n">repo</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="p">(</span><span class="n">one</span><span class="w"> </span><span class="n">per</span><span class="w"> </span><span class="n">team</span><span class="p">)</span>
+<span class="err">├──</span><span class="w"> </span><span class="o">.</span><span class="n">deploy</span><span class="o">/</span>
+<span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">deploy_fabric_workspace</span><span class="o">.</span><span class="n">py</span><span class="w">       </span><span class="err">←</span><span class="w"> </span><span class="n">deployment</span><span class="w"> </span><span class="n">script</span>
+<span class="err">├──</span><span class="w"> </span><span class="o">.</span><span class="n">pipelines</span><span class="o">/</span>
+<span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">deploy_workspace_uat</span><span class="o">.</span><span class="n">yml</span><span class="w">         </span><span class="err">←</span><span class="w"> </span><span class="n">UAT</span><span class="w"> </span><span class="n">pipeline</span>
+<span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">deploy_workspace_prod</span><span class="o">.</span><span class="n">yml</span><span class="w">        </span><span class="err">←</span><span class="w"> </span><span class="n">PROD</span><span class="w"> </span><span class="n">pipeline</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">workspace</span><span class="o">/</span>
+<span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">engineering</span><span class="o">/</span><span class="w">                     </span><span class="err">←</span><span class="w"> </span><span class="n">all</span><span class="w"> </span><span class="n">data</span><span class="w"> </span><span class="n">engineering</span><span class="w"> </span><span class="n">Fabric</span><span class="w"> </span><span class="n">items</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">project_one</span><span class="o">/</span><span class="w">                 </span><span class="err">←</span><span class="w"> </span><span class="n">project</span><span class="w"> </span><span class="n">directory</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">copyjobs</span><span class="o">/</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">dataflowsGen2</span><span class="p">(</span><span class="n">CICD</span><span class="p">)</span><span class="o">/</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">environments</span><span class="o">/</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">lakehouses</span><span class="o">/</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">notebooks</span><span class="o">/</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">pipelines</span><span class="o">/</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">variablelibraries</span><span class="o">/</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">parameter</span><span class="o">.</span><span class="n">yml</span><span class="w">            </span><span class="err">←</span><span class="w"> </span><span class="n">environment</span><span class="w"> </span><span class="n">parameterization</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">README</span><span class="o">.</span><span class="n">md</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">project_two</span><span class="o">/</span><span class="w">                 </span><span class="err">←</span><span class="w"> </span><span class="n">another</span><span class="w"> </span><span class="n">project</span><span class="w"> </span><span class="n">directory</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">       </span><span class="err">└──</span><span class="w"> </span><span class="n">README</span><span class="o">.</span><span class="n">md</span>
+<span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">presentation</span><span class="o">/</span><span class="w">                    </span><span class="err">←</span><span class="w"> </span><span class="n">semantic</span><span class="w"> </span><span class="n">models</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="n">reports</span>
+<span class="err">│</span><span class="w">       </span><span class="err">├──</span><span class="w"> </span><span class="n">project_one</span><span class="o">/</span><span class="w">                 </span><span class="err">←</span><span class="w"> </span><span class="n">project</span><span class="w"> </span><span class="n">directory</span>
+<span class="err">│</span><span class="w">       </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">semantic_models_reports</span><span class="o">/</span>
+<span class="err">│</span><span class="w">       </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">variablelibraries</span><span class="o">/</span>
+<span class="err">│</span><span class="w">       </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">parameter</span><span class="o">.</span><span class="n">yml</span><span class="w">            </span><span class="err">←</span><span class="w"> </span><span class="n">environment</span><span class="w"> </span><span class="n">parameterization</span>
+<span class="err">│</span><span class="w">       </span><span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">README</span><span class="o">.</span><span class="n">md</span>
+<span class="err">│</span><span class="w">       </span><span class="err">└──</span><span class="w"> </span><span class="n">project_two</span><span class="o">/</span><span class="w">                 </span><span class="err">←</span><span class="w"> </span><span class="n">another</span><span class="w"> </span><span class="n">project</span><span class="w"> </span><span class="n">directory</span>
+<span class="err">│</span><span class="w">           </span><span class="err">├──</span><span class="w"> </span><span class="n">semantic_models_reports</span><span class="o">/</span>
+<span class="err">│</span><span class="w">           </span><span class="err">├──</span><span class="w"> </span><span class="n">variablelibraries</span><span class="o">/</span>
+<span class="err">│</span><span class="w">           </span><span class="err">├──</span><span class="w"> </span><span class="n">parameter</span><span class="o">.</span><span class="n">yml</span>
+<span class="err">│</span><span class="w">           </span><span class="err">└──</span><span class="w"> </span><span class="n">README</span><span class="o">.</span><span class="n">md</span>
+<span class="err">├──</span><span class="w"> </span><span class="o">.</span><span class="n">gitignore</span>
+<span class="err">└──</span><span class="w"> </span><span class="n">README</span><span class="o">.</span><span class="n">md</span>
+</code></pre></div>
+
+<p><strong>Key design decisions:</strong></p>
+<ul>
+<li><code>.deploy/</code> and <code>.pipelines/</code> are kept outside <code>workspace/</code> intentionally — <code>fabric-cicd</code> deploys everything under <code>workspace/</code>, and deployment scripts should not be treated as Fabric items</li>
+<li><strong><code>workspace/engineering/</code></strong> contains all data engineering Fabric items — notebooks, pipelines, lakehouses, environments, copy jobs, dataflows, and variable libraries. Each team's project goes into its own directory under <code>engineering/</code></li>
+<li><strong><code>workspace/presentation/</code></strong> contains semantic models and reports — kept separate from engineering items for cleaner scope management and independent deployments</li>
+<li><code>parameter.yml</code> lives alongside the Fabric items it parameterizes — scoped to that project directory, not the repo root</li>
+<li><strong>Feature branches share the same <code>workspace/</code> folder structure</strong> — when a developer syncs their Feature workspace to a feature branch via Fabric Git Sync, items land in the same directory paths. This makes merging from feature → dev clean and predictable, with no structural divergence between branches</li>
+</ul>
+<hr />
+<h2>Branch Strategy and Promotion Flow</h2>
+<p>The promotion model operates in two layers — developers iterate freely in Feature and DEV workspaces using Fabric Git Sync, while UAT and PROD deployments are controlled, pipeline-driven promotions triggered by deliberate PR merges.</p>
+<h3>The Four Branch Types</h3>
+<p><strong><code>feature/&lt;n&gt;</code></strong> — Long-lived. Connected to each developer's personal Feature workspace via Fabric Git Sync (bidirectional). Developers commit changes from the workspace to this branch and pull updates back. Maintains full history.</p>
+<p><strong><code>dev</code></strong> — Long-lived. Connected to the shared DEV workspace via Fabric Git Sync (bidirectional). This is the central integration point — all feature branches target <code>dev</code> first.</p>
+<p><strong><code>uat</code></strong> — Long-lived. Not connected to any workspace via Git. When a PR merges into <code>uat</code>, the ADO pipeline reads the repo and deploys item definitions directly to the UAT workspace using <code>fabric-cicd</code>.</p>
+<p><strong><code>main</code></strong> — Long-lived. Not connected to any workspace via Git. Same model as <code>uat</code> — ADO pipeline reads the repo and deploys directly to the PROD workspace on PR merge. Policy-gated with stricter approvals.</p>
+<h3>One Rule Across All Promotions — Always Squash Merge</h3>
+<p>Regardless of which branch transition you are performing — <code>feature → dev</code>, <code>dev → uat</code>, or <code>uat → main</code> — <strong>always use Squash Merge, never a regular commit merge.</strong></p>
+<p>Squash merge collapses all commits from the source branch into a single, clean commit on the target branch. This keeps the history of <code>dev</code>, <code>uat</code>, and <code>main</code> concise and readable — each commit on these branches represents a complete, reviewable unit of work rather than a noisy stream of granular development commits. It also makes cherry-picking significantly simpler, since each promotion is represented by a single commit SHA rather than a range of commits to track.</p>
+<blockquote>
+<p>✅ <code>feature → dev</code> — Squash merge<br />
+✅ <code>promote/dev-to-uat → uat</code> — Squash merge<br />
+✅ <code>promote/uat-to-prod → main</code> — Squash merge</p>
+</blockquote>
+<hr />
+<h3>Phase 1 — Developer Inner Loop (Feature and DEV workspaces via Git Sync)</h3>
+<p>Both Feature and DEV workspaces use <strong>Fabric's native Git integration</strong> — a fully bidirectional sync between the workspace and its branch. No ADO pipeline is involved at this layer:</p>
+<ul>
+<li>Developer builds or modifies items directly in the Fabric UI</li>
+<li>They commit changes from the workspace to the branch using Fabric Git Sync</li>
+<li>They can also pull changes from the branch back into the workspace at any time</li>
+</ul>
+<div class="codehilite"><pre><span></span><code>Feature Workspace  ◄──── Sync to Git ────►  feature/&lt;n&gt; branch
+                         (bidirectional)
+
+DEV Workspace      ◄──── Sync to Git ────►  dev branch
+                         (bidirectional)
+</code></pre></div>
+
+<p>Feature branches are always created <strong>from <code>dev</code></strong> — not from <code>uat</code> or <code>main</code> — to ensure developers start from the latest integrated state:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Always base feature branches off the latest dev</span>
+git<span class="w"> </span>checkout<span class="w"> </span>dev<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>pull<span class="w"> </span>origin<span class="w"> </span>dev
+git<span class="w"> </span>checkout<span class="w"> </span>-b<span class="w"> </span>feature/my-feature
+
+<span class="c1"># ... developer works in Feature workspace, syncing to this branch ...</span>
+
+<span class="c1"># When ready, open PR: feature/my-feature → dev</span>
+<span class="c1"># Use Squash merge — do NOT delete the source branch (feature branches are long-lived)</span>
+</code></pre></div>
+
+<p>When the PR merges into <code>dev</code>, a developer manually syncs the DEV workspace from the <code>dev</code> branch using Fabric Git Sync. This step can also be automated using the <a href="https://learn.microsoft.com/en-us/rest/api/fabric/core/git/update-from-git">Fabric Git Sync API</a> — triggering an <code>updateFromGit</code> call as part of the ADO pipeline immediately after the PR merge.</p>
+<div class="codehilite"><pre><span></span><code>feature/&lt;n&gt; ──── PR merge (squash) ────► dev branch
+                                                │
+                                      Fabric Git Sync (manual)
+                                                │
+                                                ▼
+                                       DEV Fabric Workspace
+</code></pre></div>
+
+<h3>Squash Merge + Sync Feature Branch Back to Dev</h3>
+<p>Because feature branches are long-lived, there is one critical step after every squash merge into <code>dev</code> — <strong>merge <code>dev</code> back into the feature branch immediately</strong>.</p>
+<p><strong>Why this matters:</strong> A squash merge collapses all feature commits into a single commit on <code>dev</code>. The feature branch itself still carries its original granular commits. If the developer continues working on the feature branch without merging <code>dev</code> back, the next PR will look noisy — it will appear to contain all the previously merged commits again, even though the actual diff is small. Merging <code>dev</code> back into the feature branch aligns the histories and ensures future PRs only surface genuinely new work.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Step 1 — Open PR: feature/my-feature → dev</span>
+<span class="c1"># Complete with Squash merge (do NOT delete source branch)</span>
+
+<span class="c1"># Step 2 — Immediately merge dev back into the feature branch</span>
+git<span class="w"> </span>checkout<span class="w"> </span>feature/my-feature
+git<span class="w"> </span>merge<span class="w"> </span>origin/dev
+
+<span class="c1"># Step 3 — Push the updated feature branch</span>
+git<span class="w"> </span>push<span class="w"> </span>origin<span class="w"> </span>feature/my-feature
+
+<span class="c1"># Step 4 — Sync the Feature workspace with the updated branch</span>
+<span class="c1"># via Fabric Git Sync → Update all</span>
+</code></pre></div>
+
+<p>After this, the feature branch history is aligned with <code>dev</code> — future commits and PRs from this branch will only contain new work going forward.</p>
+<h3>How Developer Collaboration Works Through the DEV Workspace</h3>
+<p>The <code>dev</code> branch and DEV workspace are the <strong>central integration point</strong> for the team. Multiple developers work in parallel, each in their own Feature workspace and feature branch. Here is how they stay in sync with each other:</p>
+<p><strong>Developer A finishes their feature and merges into dev:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Developer A opens PR: feature/developerA → dev (squash merge)</span>
+<span class="c1"># PR is reviewed and merged</span>
+<span class="c1"># Developer manually syncs the DEV workspace from the dev branch using Fabric Git Sync</span>
+<span class="c1"># (this can also be automated via the Fabric Git Sync API — updateFromGit)</span>
+<span class="c1"># All team members can now see the latest changes in the DEV workspace</span>
+</code></pre></div>
+
+<p><strong>Developer B pulls the latest dev changes into their Feature workspace:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Developer B updates their local feature branch with the latest dev</span>
+git<span class="w"> </span>checkout<span class="w"> </span>feature/developerB
+git<span class="w"> </span>merge<span class="w"> </span>origin/dev
+<span class="c1"># or rebase:</span>
+git<span class="w"> </span>rebase<span class="w"> </span>origin/dev
+
+<span class="c1"># Then pulls the updated branch into their Feature workspace</span>
+<span class="c1"># via Fabric Git Sync → Update all / Pull</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>Rebase caveat:</strong> <code>git rebase</code> rewrites commit SHAs, producing a clean linear history without merge commits. However, if two developers share the same feature branch, rebase will cause their copies to diverge — use <code>git merge</code> in that case. Since feature branches in this model are per developer (<code>feature/developerA</code>, <code>feature/developerB</code>), rebase is generally safe as no one else is working on the same branch.</p>
+</blockquote>
+<p>This pull step is important — it keeps each developer's Feature workspace aligned with the team's integrated state in DEV, reducing merge conflicts and ensuring no one builds on top of stale items.</p>
+<p><strong>The DEV workspace acts as a shared preview environment:</strong></p>
+<ul>
+<li>Any developer or stakeholder can open the DEV workspace to see the latest integrated state of all merged features</li>
+<li>Items in DEV reflect the exact state of the <code>dev</code> branch — because the workspace is Git-synced, there is no drift between what is in the branch and what is in the workspace</li>
+<li>If a developer needs to test how their feature interacts with another developer's recently merged work, they simply pull <code>dev</code> into their feature branch and sync to their Feature workspace</li>
+</ul>
+<p><strong>Merge conflicts during collaboration:</strong></p>
+<p>If two developers modify the same Fabric item (e.g. the same notebook or semantic model definition), a merge conflict will surface when the second developer opens a PR into <code>dev</code>. The conflict must be resolved in the <code>.tmdl</code> / <code>.json</code> definition files in the repo before the PR can complete — the same way code conflicts are resolved in any standard Git workflow. After resolving and merging, the DEV workspace syncs automatically.</p>
+<hr />
+<h3>Phase 2 — UAT Promotion via Cherry-Pick (dev → uat)</h3>
+<p>Once changes are integrated and validated in DEV, they are promoted to UAT via a <strong>cherry-pick promotion branch</strong> — not a direct merge from <code>dev</code> to <code>uat</code>. This prevents all accumulated dev commits (including unfinished work from other developers) from landing in UAT.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. Start from the latest remote uat branch</span>
+git<span class="w"> </span>checkout<span class="w"> </span>uat<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>pull<span class="w"> </span>origin<span class="w"> </span>uat
+
+<span class="c1"># 2. Create a short-lived promotion branch from uat</span>
+git<span class="w"> </span>checkout<span class="w"> </span>-b<span class="w"> </span>promote/dev-to-uat/2026.03.14
+
+<span class="c1"># 3. Identify the squash commit(s) on dev to promote</span>
+git<span class="w"> </span>log<span class="w"> </span>--oneline<span class="w"> </span>origin/dev<span class="w"> </span>-n<span class="w"> </span><span class="m">20</span>
+
+<span class="c1"># 4. Cherry-pick the validated commit(s)</span>
+git<span class="w"> </span>cherry-pick<span class="w"> </span>&lt;sha&gt;
+<span class="c1"># For multiple commits:</span>
+git<span class="w"> </span>cherry-pick<span class="w"> </span>&lt;sha1&gt;<span class="w"> </span>&lt;sha2&gt;<span class="w"> </span>&lt;sha3&gt;
+
+<span class="c1"># If conflicts occur:</span>
+git<span class="w"> </span>status
+<span class="c1"># fix conflicts...</span>
+git<span class="w"> </span>add<span class="w"> </span>&lt;files&gt;
+git<span class="w"> </span>cherry-pick<span class="w"> </span>--continue
+<span class="c1"># Abort if needed: git cherry-pick --abort</span>
+
+<span class="c1"># 5. Push and open PR into uat</span>
+git<span class="w"> </span>push<span class="w"> </span>-u<span class="w"> </span>origin<span class="w"> </span>promote/dev-to-uat/2026.03.14
+</code></pre></div>
+
+<p><strong>PR title convention:</strong> <code>Promote DEV → UAT: 2026.03.14</code></p>
+<p><strong>PR completion settings:</strong><br />
+- ✅ Squash merge<br />
+- ✅ Delete source branch after merge</p>
+<p>When the PR merges into <code>uat</code>, the <strong>UAT ADO pipeline</strong> triggers and deploys to the <strong>UAT Fabric workspace</strong> for business/QA validation.</p>
+<hr />
+<h3>Phase 3 — PROD Promotion via Cherry-Pick (uat → main)</h3>
+<p>Once changes are validated in UAT, they are promoted to PROD using the same cherry-pick pattern. When the PR into <code>main</code> merges, the ADO PROD pipeline checks out the <code>main</code> branch and runs <code>fabric-cicd</code> to deploy directly to the PROD workspace. Like UAT, the PROD workspace has no Git sync connection — it receives items only via the pipeline.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. Start from the latest remote main branch</span>
+git<span class="w"> </span>checkout<span class="w"> </span>main<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>pull<span class="w"> </span>origin<span class="w"> </span>main
+
+<span class="c1"># 2. Create a short-lived promotion branch from main</span>
+git<span class="w"> </span>checkout<span class="w"> </span>-b<span class="w"> </span>promote/uat-to-prod/2026.03.14
+
+<span class="c1"># 3. Identify the squash commit(s) on uat to promote</span>
+git<span class="w"> </span>log<span class="w"> </span>--oneline<span class="w"> </span>origin/uat<span class="w"> </span>-n<span class="w"> </span><span class="m">20</span>
+
+<span class="c1"># 4. Cherry-pick the validated commit(s)</span>
+git<span class="w"> </span>cherry-pick<span class="w"> </span>&lt;sha&gt;
+
+<span class="c1"># 5. Push and open PR into main</span>
+git<span class="w"> </span>push<span class="w"> </span>-u<span class="w"> </span>origin<span class="w"> </span>promote/uat-to-prod/2026.03.14
+</code></pre></div>
+
+<p><strong>PR title convention:</strong> <code>Promote UAT → PROD: 2026.03.14</code></p>
+<p>When the PR merges into <code>main</code>, the <strong>PROD ADO pipeline</strong> triggers and deploys to the <strong>PROD Fabric workspace</strong>.</p>
+<hr />
+<h3>The Full Flow End-to-End</h3>
+<div class="codehilite"><pre><span></span><code>Developer builds in Feature Workspace
+         │
+         │  Fabric native Git sync (bidirectional)
+         ▼
+feature/&lt;n&gt; branch  ◄────────────────────────────────  Feature Workspace
+         │                  (bidirectional Git sync)
+         │  PR → dev  (squash merge)
+         ▼
+dev branch  ◄────────────────────────────────────────  DEV Workspace
+         │          (bidirectional Git sync)
+         │
+         │  Cherry-pick via promote/dev-to-uat/&lt;release&gt;
+         │  PR → uat  (squash merge)
+         ▼
+uat branch  ──── ADO pipeline reads repo ────────────► UAT Workspace
+         │       (fabric-cicd, no Git sync on workspace)
+         │
+         │  Cherry-pick via promote/uat-to-prod/&lt;release&gt;
+         │  PR → main  (squash merge)
+         ▼
+main branch ──── ADO pipeline reads repo ────────────► PROD Workspace
+                  (fabric-cicd, no Git sync on workspace)
+</code></pre></div>
+
+<h3>Why Cherry-Pick for UAT and PROD Promotion?</h3>
+<p>Because <code>fabric-cicd</code> performs a <strong>full deployment every time</strong> — it deploys <em>everything</em> in the repository directory to the target workspace. A regular merge from <code>dev</code> into <code>uat</code> or <code>main</code> promotes the <strong>entire branch state</strong>, not just what's ready — making it impossible to ship only validated changes and turning rollbacks into reverting large merge commits instead of a single clean PR unit.</p>
+<p>Cherry-pick into a promotion branch gives surgical control: each PR becomes a clean, intentional, independently revertable unit. You can move it forward or roll it back without touching anything else.</p>
+<h3>Why Not Cherry-Pick Directly Onto the Environment Branch?</h3>
+<p>Cherry-picks are never applied directly onto <code>uat</code> or <code>main</code>. Instead they are cherry-picked into a <strong>short-lived promotion branch</strong> (<code>promote/dev-to-uat/&lt;release&gt;</code>, <code>promote/uat-to-prod/&lt;release&gt;</code>), then merged via a PR — and that PR is squash-merged too. This keeps the target branch history clean and ensures every change on <code>uat</code> and <code>main</code> went through a proper review and approval gate, not a silent direct commit.</p>
+<h3>Dev, UAT, and PROD Are Intentionally Different — That's by Design</h3>
+<p>There is no expectation that <code>dev</code>, <code>uat</code>, and <code>main</code> stay in sync or have aligned histories. They are <strong>independent environment branches</strong> with intentionally different histories. Promotion is not "moving the same commit forward" — it is creating a new PR and commit in the target branch that represents <strong>approval for that environment</strong>.</p>
+<p>This enables a clean evolving feature pattern. A single feature might have:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">dev</span><span class="o">:</span><span class="w">   </span><span class="mi">7</span><span class="w"> </span><span class="n">PRs</span><span class="w">  </span><span class="o">(</span><span class="n">iterative</span><span class="w"> </span><span class="n">development</span><span class="o">,</span><span class="w"> </span><span class="n">rapid</span><span class="w"> </span><span class="n">commits</span><span class="o">)</span>
+<span class="n">uat</span><span class="o">:</span><span class="w">   </span><span class="mi">2</span><span class="w"> </span><span class="n">PRs</span><span class="w">  </span><span class="o">(</span><span class="n">consolidated</span><span class="o">,</span><span class="w"> </span><span class="n">validated</span><span class="w"> </span><span class="n">increments</span><span class="o">)</span>
+<span class="n">main</span><span class="o">:</span><span class="w">  </span><span class="mi">1</span><span class="w"> </span><span class="n">PR</span><span class="w">   </span><span class="o">(</span><span class="n">single</span><span class="w"> </span><span class="n">approved</span><span class="w"> </span><span class="n">unit</span><span class="w"> </span><span class="n">representing</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">full</span><span class="w"> </span><span class="n">feature</span><span class="o">)</span>
+</code></pre></div>
+
+<p>The PROD PR naturally becomes the superset of all approved changes — without any of the development noise.</p>
+<h3>The Only Divergences That Actually Matter</h3>
+<p>You do not need to keep <code>dev</code>, <code>uat</code>, and <code>main</code> in lockstep. The only two divergences worth actively managing are:</p>
+<ul>
+<li><strong>Feature branch vs <code>dev</code></strong> — keep feature branches rebased on <code>dev</code> so PRs stay focused on new work only. As other developers merge into <code>dev</code>, your feature branch falls behind. Rebasing replays your commits on top of the latest <code>dev</code>, ensuring your PR shows only your actual changes — not noise from commits you haven't seen yet.</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Keep your feature branch up to date with dev</span>
+git<span class="w"> </span>checkout<span class="w"> </span>feature/developerB
+git<span class="w"> </span>rebase<span class="w"> </span>origin/dev
+git<span class="w"> </span>push<span class="w"> </span>--force-with-lease<span class="w"> </span>origin<span class="w"> </span>feature/developerB
+
+<span class="c1"># Then sync your Feature workspace via Fabric Git Sync → Update all</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Promotion branches vs their target</strong> — always create promotion branches from the latest <code>uat</code> or <code>main</code>. This ensures the promotion branch is ahead of its target with only the new cherry-picked commit(s), avoiding conflicts from commits already in the target branch that your promotion branch doesn't know about.</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Always start a promotion branch from the latest target</span>
+git<span class="w"> </span>checkout<span class="w"> </span>uat<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>pull<span class="w"> </span>origin<span class="w"> </span>uat
+git<span class="w"> </span>checkout<span class="w"> </span>-b<span class="w"> </span>promote/dev-to-uat/release
+git<span class="w"> </span>cherry-pick<span class="w"> </span>&lt;sha&gt;<span class="w">   </span><span class="c1"># add only what you want to promote</span>
+</code></pre></div>
+
+<p>Everything else — <code>dev</code> vs <code>uat</code>, <code>uat</code> vs <code>main</code> — diverges intentionally. <code>uat</code> only contains what has been explicitly promoted and validated. <code>main</code> only contains what has been approved for production. The gap between them is not a problem to fix — it is the model working as designed. Optimize for <strong>clean, auditable promotion and safe rollback</strong>, not branch alignment.</p>
+<hr />
+<h2>The Deployment Script</h2>
+<p>The Python deployment script (<code>deploy_fabric_workspace.py</code>) is intentionally minimal — it delegates all deployment logic to the <code>fabric-cicd</code> library and accepts all configuration via CLI arguments passed from the ADO pipeline.</p>
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">azure.identity</span><span class="w"> </span><span class="kn">import</span> <span class="n">AzureCliCredential</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">fabric_cicd</span><span class="w"> </span><span class="kn">import</span> <span class="n">FabricWorkspace</span><span class="p">,</span> <span class="n">publish_all_items</span><span class="p">,</span> <span class="n">unpublish_all_orphan_items</span><span class="p">,</span> \
+    <span class="n">change_log_level</span><span class="p">,</span> <span class="n">append_feature_flag</span>
+
+<span class="c1"># Force unbuffered output — critical for real-time ADO pipeline log streaming</span>
+<span class="n">sys</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">reconfigure</span><span class="p">(</span><span class="n">line_buffering</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">write_through</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">sys</span><span class="o">.</span><span class="n">stderr</span><span class="o">.</span><span class="n">reconfigure</span><span class="p">(</span><span class="n">line_buffering</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">write_through</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+<span class="c1"># Enable DEBUG logging when SYSTEM_DEBUG is set in the ADO pipeline</span>
+<span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;SYSTEM_DEBUG&quot;</span><span class="p">,</span> <span class="s2">&quot;false&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="o">==</span> <span class="s2">&quot;true&quot;</span><span class="p">:</span>
+    <span class="n">change_log_level</span><span class="p">(</span><span class="s2">&quot;DEBUG&quot;</span><span class="p">)</span>
+
+<span class="n">root_directory</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="vm">__file__</span><span class="p">)</span><span class="o">.</span><span class="n">resolve</span><span class="p">()</span><span class="o">.</span><span class="n">parent</span><span class="o">.</span><span class="n">parent</span>
+
+<span class="c1"># Enable shortcut publishing support</span>
+<span class="n">append_feature_flag</span><span class="p">(</span><span class="s2">&quot;enable_shortcut_publish&quot;</span><span class="p">)</span>
+
+<span class="n">parser</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
+<span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--workspace_id&#39;</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">)</span>
+<span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--environment&#39;</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">)</span>
+<span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--repository_directory&#39;</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">)</span>
+<span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--item_type_in_scope&#39;</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">)</span>
+<span class="n">args</span> <span class="o">=</span> <span class="n">parser</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+
+<span class="c1"># AzureCliCredential works both locally (developer az login) and in ADO pipelines</span>
+<span class="c1"># (via AzureCLI@2 task which injects a valid token automatically)</span>
+<span class="n">token_credential</span> <span class="o">=</span> <span class="n">AzureCliCredential</span><span class="p">()</span>
+
+<span class="n">target_workspace</span> <span class="o">=</span> <span class="n">FabricWorkspace</span><span class="p">(</span>
+    <span class="n">workspace_id</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">workspace_id</span><span class="p">,</span>
+    <span class="n">environment</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">environment</span><span class="p">,</span>
+    <span class="n">repository_directory</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">repository_directory</span><span class="p">,</span>
+    <span class="n">item_type_in_scope</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">item_type_in_scope</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;,&quot;</span><span class="p">),</span>
+    <span class="n">token_credential</span><span class="o">=</span><span class="n">token_credential</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="n">publish_all_items</span><span class="p">(</span><span class="n">target_workspace</span><span class="p">)</span>
+
+<span class="c1"># Uncomment only when orphan cleanup is explicitly required — see caution below</span>
+<span class="c1"># unpublish_all_orphan_items(target_workspace)</span>
+</code></pre></div>
+
+<h3>Key Design Decisions</h3>
+<p><strong><code>AzureCliCredential</code></strong> — This is the authentication bridge between the ADO pipeline and Fabric. When the pipeline runs inside the <code>AzureCLI@2</code> task, Azure CLI is already authenticated via the service connection. <code>AzureCliCredential</code> picks up that token automatically — no secrets or client credentials needed in the script itself.</p>
+<p><strong><code>append_feature_flag("enable_shortcut_publish")</code></strong> — Enables OneLake shortcut deployment support, which is in preview in <code>fabric-cicd</code>. Include this if your workspace contains shortcuts.</p>
+<p><strong><code>unpublish_all_orphan_items</code> — When it makes sense and when to be cautious</strong></p>
+<p><code>unpublish_all_orphan_items</code> removes Fabric items that exist in the target workspace but are <strong>absent from the repo</strong>. It enforces the repo as the single source of truth — anything not in Git gets removed from the workspace.</p>
+<p><strong>When it makes sense:</strong><br />
+- You have deliberately removed an item from the repo (e.g. a deprecated report or notebook) and want it automatically cleaned up from the workspace on the next deployment<br />
+- You want strict workspace governance — no items should exist in production unless they are tracked in Git<br />
+- You are doing a clean initial deployment and want to ensure the workspace exactly mirrors the repo state</p>
+<p><strong>⚠️ When to be cautious — use with care:</strong><br />
+- A developer creates a new item directly in the Fabric workspace (outside Git) and hasn't committed it yet — it will be <strong>deleted silently</strong> on the next pipeline run<br />
+- A file is accidentally omitted from the repo due to a bad commit or <code>.gitignore</code> misconfiguration — the corresponding workspace item gets deleted<br />
+- Items managed by other teams or processes that live in the same workspace but outside the repo scope could be affected<br />
+- In production environments, the risk of accidental deletion outweighs the cleanup benefit in most cases</p>
+<p><strong>Our approach:</strong> <code>unpublish_all_orphan_items</code> is intentionally commented out by default. Enable it only when you have full confidence that the repo is the complete and accurate representation of everything that should exist in the workspace — and preferably test in DEV or UAT first before enabling in PROD.</p>
+<p><strong><code>--item_type_in_scope</code></strong> — this ADO variable controls what gets deployed. Running a full deployment on every pipeline run is expensive; scoping to only the changed item types significantly reduces deployment time.</p>
+<p>Supported types: <code>VariableLibrary, Environment, Notebook, DataPipeline, Lakehouse, CopyJob, Dataflow, SemanticModel, Report</code></p>
+<hr />
+<h2>The ADO Pipeline</h2>
+<p>Two separate YAML files exist — one for UAT (<code>deploy_workspace_uat.yml</code>) and one for PROD (<code>deploy_workspace_prod.yml</code>). Each references its own ADO Variable Group.</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">trigger</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">none</span><span class="w">  </span><span class="c1"># Manual or PR-merge triggered only</span>
+
+<span class="nt">variables</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Fabric_Deployment_Group_UAT</span><span class="w">  </span><span class="c1"># Switch to _PROD for the prod pipeline</span>
+
+<span class="nt">stages</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">stage</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Build</span>
+<span class="w">    </span><span class="nt">jobs</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">job</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Build</span>
+<span class="w">        </span><span class="nt">pool</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Default</span>
+<span class="w">        </span><span class="nt">steps</span><span class="p">:</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">checkout</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">self</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">task</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PublishPipelineArtifact@1</span>
+<span class="w">            </span><span class="nt">inputs</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">targetPath</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;$(System.DefaultWorkingDirectory)&#39;</span>
+<span class="w">              </span><span class="nt">artifact</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">build</span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">stage</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Release</span>
+<span class="w">    </span><span class="nt">dependsOn</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Build</span>
+<span class="w">    </span><span class="nt">jobs</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">job</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Release</span>
+<span class="w">        </span><span class="nt">pool</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Default</span>
+<span class="w">        </span><span class="nt">steps</span><span class="p">:</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">checkout</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">none</span>
+
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">task</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PowerShell@2</span>
+<span class="w">            </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;Clean</span><span class="nv"> </span><span class="s">build</span><span class="nv"> </span><span class="s">folder&#39;</span>
+<span class="w">            </span><span class="nt">inputs</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">targetType</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;inline&#39;</span>
+<span class="w">              </span><span class="nt">script</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">                </span><span class="no">$p = &#39;$(Pipeline.Workspace)\build&#39;</span>
+<span class="w">                </span><span class="no">if (Test-Path $p) { Remove-Item $p -Recurse -Force }</span>
+
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">task</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">DownloadPipelineArtifact@2</span>
+<span class="w">            </span><span class="nt">inputs</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">artifact</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">build</span>
+<span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;$(Pipeline.Workspace)\build&#39;</span>
+
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">task</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">UsePythonVersion@0</span>
+<span class="w">            </span><span class="nt">inputs</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">versionSpec</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;3.12.10&#39;</span>
+<span class="w">              </span><span class="nt">addToPath</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">script</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">              </span><span class="no"># Installing from private JFrog Artifactory (enterprise use case)</span>
+<span class="w">              </span><span class="no"># If you don&#39;t have a private registry, install directly from PyPI:</span>
+<span class="w">              </span><span class="no"># python -m pip install --upgrade fabric-cicd azure-identity</span>
+<span class="w">              </span><span class="no">python -m pip install --upgrade -i https://&lt;your-artifactory&gt;/api/pypi/&lt;your-feed&gt;/simple fabric-cicd azure-identity</span>
+<span class="w">              </span><span class="no">python -m pip show fabric-cicd</span>
+<span class="w">              </span><span class="no">python -m pip show azure-identity</span>
+<span class="w">            </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;Install</span><span class="nv"> </span><span class="s">fabric-cicd</span><span class="nv"> </span><span class="s">and</span><span class="nv"> </span><span class="s">azure-identity&#39;</span>
+
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">task</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">AzureCLI@2</span>
+<span class="w">            </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;Deploy</span><span class="nv"> </span><span class="s">Fabric</span><span class="nv"> </span><span class="s">Workspace&#39;</span>
+<span class="w">            </span><span class="nt">inputs</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">azureSubscription</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;&lt;your-azure-service-connection&gt;&#39;</span>
+<span class="w">              </span><span class="nt">scriptType</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;ps&#39;</span>
+<span class="w">              </span><span class="nt">scriptLocation</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;inlineScript&#39;</span>
+<span class="w">              </span><span class="nt">inlineScript</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">                </span><span class="no">$script = &quot;$(Pipeline.Workspace)/build/.deploy/deploy_fabric_workspace.py&quot;</span>
+<span class="w">                </span><span class="no">python -u &quot;$script&quot; `</span>
+<span class="w">                  </span><span class="no">--workspace_id &quot;$(workspace_guid)&quot; `</span>
+<span class="w">                  </span><span class="no">--environment &quot;$(fabric_vl_vset_active)&quot; `</span>
+<span class="w">                  </span><span class="no">--item_type_in_scope &quot;$(fabric_item_type_inscope)&quot; `</span>
+<span class="w">                  </span><span class="no">--repository_directory &quot;$(Pipeline.Workspace)/build/workspace/engineering/$(repo_project_directory)&quot;</span>
+</code></pre></div>
+
+<h3>Why <code>python -m pip</code> and Not Plain <code>pip</code></h3>
+<p>This is one of the most common silent failures in ADO Python pipelines. ADO agents often have multiple Python installations, and plain <code>pip</code> may resolve to a different interpreter than the one <code>UsePythonVersion</code> configured. Using <code>python -m pip</code> guarantees that packages install into exactly the same interpreter that will run the script — eliminating version mismatch errors that produce cryptic <code>ModuleNotFoundError</code> failures at runtime.</p>
+<h3>Why Private JFrog Artifactory?</h3>
+<p>Enterprise environments often restrict public PyPI access for security and compliance reasons. Pulling <code>fabric-cicd</code> from a JFrog Artifactory virtual repository (which mirrors PyPI) ensures:<br />
+- All packages are scanned and approved<br />
+- No direct internet access required from the agent<br />
+- Repeatable builds regardless of PyPI availability</p>
+<p>If your ADO agent has direct internet access and no private registry requirement, you can install directly from PyPI — no <code>-i</code> flag needed:</p>
+<div class="codehilite"><pre><span></span><code>python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--upgrade<span class="w"> </span>fabric-cicd<span class="w"> </span>azure-identity
+</code></pre></div>
+
+<h3>The Build/Release Stage Split</h3>
+<p>The pipeline separates Build (checkout + artifact publish) from Release (download artifact + deploy). This pattern:<br />
+- Guarantees the exact same code artifact is deployed, regardless of any concurrent commits to the branch<br />
+- Supports future gate approvals between stages (e.g. manual approval before PROD)<br />
+- Makes pipeline logs cleaner — build failures are immediately distinguishable from deployment failures</p>
+<hr />
+<h2>ADO Variable Groups</h2>
+<p>Each environment has a dedicated ADO Variable Group:</p>
+<ul>
+<li><code>Fabric_Deployment_Group_UAT</code></li>
+<li><code>Fabric_Deployment_Group_PROD</code></li>
+</ul>
+<p><strong><code>workspace_guid</code></strong> — The target Fabric workspace ID. Set per environment in each variable group.</p>
+<p><strong><code>fabric_vl_vset_active</code></strong> — The active Variable Library value set, e.g. <code>UAT</code> or <code>PROD</code>. Passed as the <code>--environment</code> argument to the deployment script, which activates the matching value set in the Fabric Variable Library during deployment.</p>
+<p><strong><code>repo_project_directory</code></strong> — The project subdirectory under <code>workspace/engineering/</code> or <code>workspace/presentation/</code> to deploy. Scopes the deployment to a single team's project.</p>
+<p><strong><code>fabric_item_type_inscope</code></strong> — Controls which Fabric item types are deployed, e.g. <code>SemanticModel,Report,Notebook</code>. Scoping to only the changed item types significantly reduces deployment time.</p>
+<p>The key variable here is <code>fabric_vl_vset_active</code> — this is what makes the Fabric Variable Library environment-aware. By passing <code>UAT</code> or <code>PROD</code> as the <code>--environment</code> argument, <code>fabric-cicd</code> activates the corresponding value set in the Variable Library during deployment.</p>
+<hr />
+<h2>The <code>parameter.yml</code> File</h2>
+<p>The <code>parameter.yml</code> file is the <strong>item parameterization mechanism</strong> in <code>fabric-cicd</code>. It tells the deployment tool how to translate environment-agnostic item definitions committed to Git into environment-specific configurations in the target workspace.</p>
+<h3>When to Use <code>parameter.yml</code> vs Variable Libraries</h3>
+<p>Not all Fabric items support parameterization through the Fabric Variable Library. This determines which tool you reach for:</p>
+<p>Items that support Variable Library — use VL, no <code>parameter.yml</code> needed:<br />
+- Notebook<br />
+- Data Pipeline<br />
+- Lakehouse Shortcuts<br />
+- Copy Job<br />
+- Dataflow Gen2</p>
+<p>Items that do not yet support Variable Library — <code>parameter.yml</code> is your only option:<br />
+- <strong>Fabric Environment</strong><br />
+- <strong>Semantic Model</strong></p>
+<p><strong>The rule is simple: use Variable Libraries wherever supported. For items that don't support VL — currently Fabric Environments and Semantic Models — <code>parameter.yml</code> is your only option.</strong></p>
+<p>This will likely be a mixed approach for most teams in the near term. Microsoft is actively expanding Variable Library support across all Fabric item types, but until full coverage is reached, you need both tools working together:</p>
+<ul>
+<li><strong>Variable Library</strong> → handles runtime parameterization for notebooks, pipelines, copy jobs, shortcuts — values are read at execution time, no redeployment needed to change them</li>
+<li><strong><code>parameter.yml</code></strong> → handles deployment-time parameterization for Environments and Semantic Models — values are applied by <code>fabric-cicd</code> at the point of deployment, baked into the item definition in the target workspace</li>
+</ul>
+<h3>How It Works</h3>
+<p><code>parameter.yml</code> works in conjunction with the <code>environment</code> argument passed into the <code>FabricWorkspace</code> object — which in your ADO pipeline comes from the <code>fabric_vl_vset_active</code> variable group variable (e.g. <code>UAT</code> or <code>PROD</code>). During deployment, <code>fabric-cicd</code> reads the file and applies replacements only for the matching environment key. If the environment value is not found in <code>parameter.yml</code>, any dependent replacements are silently skipped — no error is raised.</p>
+<blockquote>
+<p><strong>Location:</strong> <code>parameter.yml</code> must sit in the <strong>root of the <code>repository_directory</code></strong> folder specified in the <code>FabricWorkspace</code> object — not the repo root.</p>
+</blockquote>
+<h3>The Four Supported Sections</h3>
+<h4>1. <code>find_replace</code> — String substitution across any item definition</h4>
+<p>Performs a literal string find-and-replace across all item definition files in the repo. Useful for replacing Lakehouse IDs, workspace IDs, connection strings, or any hardcoded value that differs between environments:</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">find_replace</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">find_value</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;your-dev-lakehouse-id&quot;</span>
+<span class="w">    </span><span class="nt">replace_value</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">UAT</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;uat-lakehouse-id&quot;</span>
+<span class="w">      </span><span class="nt">PROD</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;prod-lakehouse-id&quot;</span>
+</code></pre></div>
+
+<h4>2. <code>key_value_replace</code> — JSONPath-targeted value replacement</h4>
+<p>Targets a specific key within a JSON-based item definition using a JSONPath expression. Useful for replacing named variable values inside Data Pipelines or other structured definition files:</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">key_value_replace</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">find_key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">$.variables[?(@.name==&quot;Environment&quot;)].value</span>
+<span class="w">    </span><span class="nt">replace_value</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">UAT</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;UAT&quot;</span>
+<span class="w">      </span><span class="nt">PROD</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;PROD&quot;</span>
+</code></pre></div>
+
+<h4>3. <code>spark_pool</code> — Spark pool remapping</h4>
+<p>Remaps Spark pool instance IDs to environment-appropriate capacity pools — for example, a smaller pool in UAT and a larger one in PROD:</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">spark_pool</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">instance_pool_id</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;your-dev-pool-instance-id&quot;</span>
+<span class="w">    </span><span class="nt">replace_value</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">UAT</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Capacity&quot;</span>
+<span class="w">        </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;UAT-Pool-name&quot;</span>
+<span class="w">      </span><span class="nt">PROD</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Capacity&quot;</span>
+<span class="w">        </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;PROD-Pool-name&quot;</span>
+</code></pre></div>
+
+<h4>4. <code>semantic_model_binding</code> — Data source rebinding</h4>
+<p>Rebinds semantic models to environment-specific shared cloud connections. Supports a <code>default</code> binding (applies to all models not explicitly listed) and model-specific overrides:</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">semantic_model_binding</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">default</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">connection_id</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">UAT</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;uat-connection-id&quot;</span>
+<span class="w">      </span><span class="nt">PROD</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;prod-connection-id&quot;</span>
+<span class="w">  </span><span class="nt">models</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">semantic_model_name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;My</span><span class="nv"> </span><span class="s">Semantic</span><span class="nv"> </span><span class="s">Model&quot;</span>
+<span class="w">      </span><span class="nt">connection_id</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">UAT</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;uat-connection-id&quot;</span>
+<span class="w">        </span><span class="nt">PROD</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;prod-connection-id&quot;</span>
+</code></pre></div>
+
+<p>Without this section, a semantic model deployed to PROD would remain bound to the DEV/UAT data source connection — a silent but critical misconfiguration that causes refresh failures.</p>
+<h3>Complete <code>parameter.yml</code> Reference</h3>
+<div class="codehilite"><pre><span></span><code><span class="nt">find_replace</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">find_value</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;your-dev-lakehouse-id&quot;</span>
+<span class="w">    </span><span class="nt">replace_value</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">UAT</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;uat-lakehouse-id&quot;</span>
+<span class="w">      </span><span class="nt">PROD</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;prod-lakehouse-id&quot;</span>
+
+<span class="nt">key_value_replace</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">find_key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">$.variables[?(@.name==&quot;Environment&quot;)].value</span>
+<span class="w">    </span><span class="nt">replace_value</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">UAT</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;UAT&quot;</span>
+<span class="w">      </span><span class="nt">PROD</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;PROD&quot;</span>
+
+<span class="nt">spark_pool</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">instance_pool_id</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;your-dev-pool-instance-id&quot;</span>
+<span class="w">    </span><span class="nt">replace_value</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">UAT</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Capacity&quot;</span>
+<span class="w">        </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;UAT-Pool-name&quot;</span>
+<span class="w">      </span><span class="nt">PROD</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Capacity&quot;</span>
+<span class="w">        </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;PROD-Pool-name&quot;</span>
+
+<span class="nt">semantic_model_binding</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">default</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">connection_id</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">UAT</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;UAT-connection_id&quot;</span>
+<span class="w">      </span><span class="nt">PROD</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;PROD-connection_id&quot;</span>
+<span class="w">  </span><span class="nt">models</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">semantic_model_name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;My</span><span class="nv"> </span><span class="s">Semantic</span><span class="nv"> </span><span class="s">Model&quot;</span>
+<span class="w">      </span><span class="nt">connection_id</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">UAT</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;UAT-connection_id&quot;</span>
+<span class="w">        </span><span class="nt">PROD</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;PROD-connection_id&quot;</span>
+</code></pre></div>
+
+<hr />
+<h2>Fabric Variable Libraries — Native Environment Parameterization</h2>
+<p>The Fabric Variable Library is a <strong>Fabric-native item</strong> (not an ADO concept) that provides centralized, environment-aware configuration for notebooks, pipelines, and other Fabric items. It reduces hardcoding and provides a single place to manage environment-specific values.</p>
+<h3>Recommended Structure: Two-Library Model</h3>
+<p>Rather than one monolithic library, split into two libraries by concern:</p>
+<p><strong><code>VL_AppConfig</code></strong> — Paths, feature flags, table names, and workspace constants. Non-secret values that control application behaviour.</p>
+<p><strong><code>VL_ConnectionsAndRefs</code></strong> — GUIDs, item references, and connection identifiers. Values that point to environment-specific Fabric items and connections.</p>
+<h3>Value Sets</h3>
+<p>Each library has a <strong>Default</strong> value set and optional named value sets:</p>
+<div class="codehilite"><pre><span></span><code>VL_AppConfig
+├── Default          ← fallback values
+├── FEATURE          ← developer/feature workspace
+├── DEV              ← dev workspace
+├── UAT              ← uat workspace
+└── PROD             ← prod workspace
+</code></pre></div>
+
+<p>Only one value set is active at a time in a workspace. Switching the active set changes which values all consumers (notebooks, pipelines) see — with no code changes required.</p>
+<h3>How <code>fabric_vl_vset_active</code> Connects Everything</h3>
+<p>The ADO variable <code>fabric_vl_vset_active</code> passes the environment name (<code>UAT</code> or <code>PROD</code>) to <code>fabric-cicd</code> as the <code>--environment</code> argument. During deployment, <code>fabric-cicd</code> activates the matching value set in the Variable Library — ensuring notebooks and pipelines in the target workspace automatically use the correct environment's configuration.</p>
+<div class="codehilite"><pre><span></span><code>ADO Variable Group (UAT)
+  fabric_vl_vset_active = &quot;UAT&quot;
+         │
+         ▼
+deploy_fabric_workspace.py
+  --environment &quot;UAT&quot;
+         │
+         ▼
+fabric-cicd activates VL value set &quot;UAT&quot;
+         │
+         ▼
+All notebooks/pipelines read UAT values
+</code></pre></div>
+
+<h3>Supported Variable Types</h3>
+<ul>
+<li><strong><code>String</code></strong> — paths, names, table names</li>
+<li><strong><code>Boolean</code></strong> — feature flags</li>
+<li><strong><code>Integer</code> / <code>Number</code></strong> — thresholds and limits</li>
+<li><strong><code>DateTime</code></strong> (ISO 8601 UTC) — watermarks and cutoff dates</li>
+<li><strong><code>Guid</code></strong> — workspace IDs and item references</li>
+<li><strong><code>Item reference</code></strong> <em>(Preview)</em> — Fabric item pointer using workspaceId + itemId</li>
+</ul>
+<h3>Best Practice: Always Add Descriptions</h3>
+<p>Every variable in the library should have a <code>Note</code> (description) field set. This is not enforced by Fabric, but it significantly reduces confusion during troubleshooting, code reviews, and handovers — especially when a variable's name alone doesn't make its purpose obvious (e.g. <code>vl_wh_gold_id</code> is ambiguous without a note explaining it's the Gold Warehouse item ID).</p>
+<hr />
+<h2>What <code>fabric-cicd</code> Deploys (and What It Doesn't)</h2>
+<p>Understanding the deployment scope prevents surprises:</p>
+<p>The following item types are fully supported: Notebook, Data Pipeline, Semantic Model, Report, Variable Library, Environment, Copy Job, and Dataflow Gen2. Lakehouse is supported but deploys metadata only — no data is copied. OneLake Shortcuts are supported with the <code>enable_shortcut_publish</code> feature flag enabled. Warehouse support is currently limited.</p>
+<p><strong>Important:</strong> <code>fabric-cicd</code> deploys item <em>definitions</em> — not data. Lakehouses are created as empty containers; data loading remains the responsibility of pipelines and notebooks.</p>
+<hr />
+<h2>Conclusion</h2>
+<p>A production-grade Fabric CI/CD implementation is not just about running <code>fabric-cicd</code> from a pipeline. It is about:</p>
+<ul>
+<li>A <strong>deliberate branch strategy</strong> that prevents accidental deployments</li>
+<li><strong>Environment isolation</strong> through separate workspaces and ADO variable groups</li>
+<li><strong>Native parameterization</strong> via Fabric Variable Libraries that eliminate environment-specific hardcoding</li>
+<li><strong>Secure authentication</strong> via <code>AzureCliCredential</code> and service connections — no hardcoded secrets</li>
+<li><strong>Operational discipline</strong> — PR policies, approver guidance, and understanding the full deployment blast radius</li>
+</ul>
+<p>The patterns described here are running in production at enterprise scale. The most important lesson: <code>fabric-cicd</code> performs a <strong>full deployment every time</strong> — treat every merge to a protected branch as a production deployment event and build your review and approval process accordingly.</p>
+<hr />
+<h2>Resources</h2>
+<ul>
+<li><a href="https://github.com/microsoft/fabric-cicd">fabric-cicd GitHub</a></li>
+<li><a href="https://pypi.org/project/fabric-cicd/">fabric-cicd PyPI</a></li>
+<li><a href="https://learn.microsoft.com/en-us/fabric/cicd/variable-library/variable-library-overview">Microsoft Fabric Variable Library Docs</a></li>
+</ul>
+<hr />
+<h2>About the Author</h2>
+<p><strong>Ajit Kumar Singh</strong> is a Data Architect specializing in Microsoft Fabric and Power BI. He focuses on building scalable, enterprise-grade data platforms with a strong emphasis on CI/CD, deployment automation, and modern data engineering practices on the Microsoft stack.</p>
+<p>Connect with Ajit on <a href="https://www.linkedin.com/in/ajit-kumar-singh-92847570">LinkedIn</a></p>
+</body>
+</html>
