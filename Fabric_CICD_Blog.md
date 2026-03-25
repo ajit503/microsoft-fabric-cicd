@@ -240,7 +240,7 @@ stages:
               addToPath: true
 
           - script: |
-              python -m pip install --upgrade -i https://artifactory.medline.com/artifactory/api/pypi/biteam-fabric-pypi-virtual/simple fabric-cicd azure-identity
+              python -m pip install --upgrade -i https://xxxxxxxx.xxxxxx.com/artifactory fabric-cicd azure-identity
               python -m pip show fabric-cicd
               python -m pip show azure-identity
             displayName: 'Install fabric-cicd and azure-identity from JFrog'
