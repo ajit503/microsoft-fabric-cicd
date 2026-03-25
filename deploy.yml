@@ -1,0 +1,96 @@
+trigger : none
+
+variables:
+- group: Fabric_Deployment_Group-PROD-EnterpriseBI
+
+stages:
+  - stage: Build
+    jobs:
+      - job: Build
+        pool:
+          name: Default
+        steps:
+          - checkout: self
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)'
+              artifact: build
+              publishLocation: pipeline
+
+  - stage: Release
+    dependsOn: Build
+    jobs:
+      - job: Release
+        pool:
+          name: Default
+        steps:
+          - checkout: none
+
+          - task: PowerShell@2
+            displayName: 'Clean build folder'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $p = '$(Pipeline.Workspace)\build'
+                Write-Host "Deleting: $p"
+                if (Test-Path $p) { Remove-Item $p -Recurse -Force }
+          
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download build artifact'
+            inputs:
+              artifact: build
+              path: '$(Pipeline.Workspace)\build'
+              
+          - task: PowerShell@2
+            displayName: 'Discover Python path'
+            name: discoverPython
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Try to find the agent's tool-installed python.exe
+                $python = Get-ChildItem -Recurse "$(Agent.WorkFolder)\_tool\Python" -Filter python.exe -ErrorAction SilentlyContinue | `
+                  Sort-Object FullName | Select-Object -First 1 -ExpandProperty FullName
+                if (-not $python) {
+                  # Fallback: whatever `python` resolves to
+                  $python = (Get-Command python -ErrorAction SilentlyContinue).Source
+                }
+                if (-not $python) {
+                  Write-Error "Python interpreter not found on agent."
+                  exit 1
+                }
+                Write-Host "##vso[task.setvariable variable=PYTHON_EXE;isOutput=true]$python"
+                Write-Host "Using Python: $python"
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.12.10'
+              addToPath: true           
+          - script: |
+                  python -m pip install -i https://XXXX.XXXX.com/artifactory/XXXX fabric-cicd azure-identity
+                  python -m pip show fabric-cicd
+                  python -m pip show azure-identity
+            displayName: 'Install fabric-cicd and azure-identity from JFrog'
+            
+          - task: PowerShell@2
+            displayName: 'List downloaded artifact'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Pipeline.Workspace = $(Pipeline.Workspace)"
+                Get-ChildItem -Recurse -Force "$(Pipeline.Workspace)/build" | Select-Object FullName
+
+          - task: AzureCLI@2
+            displayName: 'Deploy Fabric Workspace (AzureCLI inline)'
+            inputs:
+                  azureSubscription: 'SC-Fabric-Devops'
+                  scriptType: 'ps'
+                  scriptLocation: 'inlineScript'
+                  inlineScript: |
+                    $script = "$(Pipeline.Workspace)/build/.deploy/deploy_workspace.py"
+                    if (-not (Test-Path $script)) { Write-Error "Not found: $script"; exit 1 }
+                    python -u "$script" `
+                      --workspace_id "$(workspace_guid)" `
+                      --environment "$(fabric_vl_vset_active)" `
+                      --item_type_in_scope "$(fabric_item_type_inscope)" `
+                      --repository_directory  "$(Pipeline.Workspace)/build/workspace/engineering/$(repo_project_directory)"
+
